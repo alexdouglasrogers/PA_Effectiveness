@@ -1,11 +1,22 @@
-# PA_Effectiveness
-Project aimed at understanding where, when, and under what conditions are protected areas most effective at preventing forest loss globally.
+Project aimed at understanding where, when, and under what conditions protected areas are most effective at preventing forest loss globally.
 
 Code and documentation for the Global Protected Area Effectiveness project.
 
+## Optional: protected-area sampling diagnostics
+
+For readers interested in the development of the treated-side sampling strategy, see:
+
+`WDPA_overlap_diagnostics.R`
+
+This script contains exploratory WDPA analyses and sampling simulations used to examine protected-area size imbalance, PA-level sampling caps, country × treatment-cohort representation, and overlap among governance and IUCN categories.
+
+These diagnostics are **entirely optional** and are not required to construct or process the Global Forest Loss Cube. They are included to document the reasoning behind the provisional treated-side sampling strategy described in:
+
+`Sampling strategy (treatment) V0.1`
+
 ## Data-processing workflow
 
-The project is currently being built as a reproducible processing pipeline. The main workflow begins with construction of the Global Forest Loss Cube (GFLC), a global ~1-km raster dataset derived from Hansen Global Forest Change data.
+The project is currently being built as a reproducible processing pipeline. The main data-processing workflow begins with construction of the Global Forest Loss Cube (GFLC), a global ~1-km raster dataset derived from Hansen Global Forest Change data.
 
 ### 1. Generate the Global Forest Loss Cube in Google Earth Engine
 
