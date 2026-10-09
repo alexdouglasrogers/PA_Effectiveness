@@ -1,0 +1,1541 @@
+// ============================================================================
+// GLOBAL FOREST LOSS CUBE (GFLC) v0.2
+// MASTER REPRODUCIBLE GOOGLE EARTH ENGINE SCRIPT
+// ============================================================================
+//
+// PURPOSE
+//   This file consolidates the entire successful GFLC v0.2 production chain
+//   into one reproducible script. It replaces the many temporary / validation /
+//   continuation scripts used while debugging high-latitude exports.
+//
+// PRODUCT DEFINITION
+//   Source:
+//     UMD/hansen/global_forest_change_2025_v1_13
+//
+//   Target grid:
+//     MODIS/061/MOD13A2 native sinusoidal projection, rescaled to 1000 m.
+//
+//   Baseline forest:
+//     Native Hansen pixels with treecover2000 >= 30%.
+//
+//   Output:
+//     Float32, 27 bands:
+//       1. mean_treecover2000
+//       2. forest_fraction_30pct
+//       3-27. loss_cellfrac_2001 ... loss_cellfrac_2025
+//
+//   Annual loss bands are fractions of the COMPLETE ~1-km cell.
+//   They represent gross Hansen loss in baseline-forest pixels.
+//
+//   Cells with forest_fraction_30pct == 0 are masked.
+//   No final analytical forest-eligibility threshold is imposed here.
+//
+// AGGREGATION
+//   Baseline:
+//     reduceResolution(mean)
+//
+//   Annual loss:
+//     lossyear -> fixedHistogram(0, 26, 26) -> annual whole-cell fractions.
+//
+// VALIDATED COMPUTATIONAL SETTINGS
+//   REDUCE_MAX_PIXELS = 8192
+//   FILE_DIMENSIONS   = 2048
+//
+//   Standard domain and 60-70N:
+//     SHARD_SIZE = 64
+//
+//   70N+:
+//     SHARD_SIZE = 32
+//
+// HIGH-LATITUDE EDGE HANDLING
+//   Every high-latitude core tile is exported with:
+//     0.25 degree geographic halo
+//     20 km source-data buffer beyond the halo
+//
+//   Hansen inputs are clipped to the buffered source region BEFORE
+//   reduceResolution(). The 0.25-degree halo was validated against the earlier
+//   successful 60-75N x 60-70E reference tile:
+//     - all old valid core cells were retained
+//     - common-cell values matched within Float32 tolerance
+//
+// PRODUCTION ARCHITECTURE
+//   STANDARD:
+//     60S-60N
+//     30 x 30 degree cores
+//     48 candidates, 9 known empty, 39 exported
+//
+//   HIGHLAT_60_65:
+//     60-65N
+//     10 x 5 degree cores
+//
+//   HIGHLAT_65_70:
+//     65-70N
+//     every 10-degree longitude block split into:
+//       65-67.5N
+//       67.5-70N
+//
+//   HIGHLAT_70PLUS_KEEP:
+//     final KEEP-only manifest from the successful native-Hansen prescreen:
+//       99 candidates screened
+//       41 KEEP
+//       58 EMPTY
+//     31 KEEP regions at 70-72.5N
+//     10 targeted Arctic regions at 72.5-75N
+//
+//   No production north of 75N because the prior northern-limit diagnostic
+//   found no qualifying >=30% baseline forest there.
+//
+// IMPORTANT: EXPECTED EMPTY-TILE BEHAVIOR
+//   The 60-65N and 65-70N stages intentionally generate the complete candidate
+//   grid. Some candidates may terminate with:
+//
+//     "No valid (un-masked) pixels in export region"
+//
+//   That means the candidate is genuinely empty under the GFLC baseline-forest
+//   definition. It is not a scientific or computational failure.
+//
+// CLEAN REBUILD VS HISTORICAL FILE INVENTORY
+//   A clean rebuild should use the stages below. It does NOT need to preserve
+//   historical v01 filenames, the old 60-75N x 60-70E benchmark tile, or any
+//   TEST / VALIDATION outputs. Those earlier files were scientifically useful
+//   during development, but are not dependencies of this master recipe.
+//
+// POST-DOWNLOAD CRS NOTE
+//   Earth Engine reports the target CRS as SR-ORG:6974 (MODIS Sinusoidal).
+//   On the ArcGIS/GDAL setup used during production, exported GeoTIFF metadata
+//   was interpreted as WGS84-ellipsoid Sinusoidal even though the pixel x/y
+//   grid was correct.
+//
+//   If that happens, use DEFINE PROJECTION ONLY (do not Project Raster /
+//   resample) and assign the MODIS spherical Sinusoidal definition:
+//
+//     +proj=sinu +lon_0=0 +x_0=0 +y_0=0
+//     +R=6371007.181 +units=m +no_defs
+//
+// ============================================================================
+
+
+// ============================================================================
+// 0. USER SETTINGS
+// ============================================================================
+//
+// RUN_STAGE options:
+//
+//   'STANDARD'
+//   'HIGHLAT_60_65'
+//   'HIGHLAT_65_70'
+//   'PRESCREEN_70PLUS'
+//   'HIGHLAT_70PLUS_KEEP'
+//
+// Recommended clean-rebuild order:
+//   1. STANDARD
+//   2. HIGHLAT_60_65
+//   3. HIGHLAT_65_70
+//   4. PRESCREEN_70PLUS       // provenance / verification; one CSV task
+//   5. HIGHLAT_70PLUS_KEEP
+//
+// For production stages, FIRST_JOB / LAST_JOB are 1-based and inclusive.
+// Start with CREATE_EXPORT_TASKS = false, inspect the Console plan, then set
+// it to true.
+//
+// ============================================================================
+
+var RUN_STAGE = 'STANDARD';
+
+var FIRST_JOB = 1;
+var LAST_JOB  = 8;
+
+var CREATE_EXPORT_TASKS = false;
+
+// Optional production job IDs to skip when resuming a partially completed stage.
+var SKIP_JOB_IDS = [];
+
+var DRIVE_FOLDER = 'Global_PA_effectiveness';
+
+
+// ============================================================================
+// 1. SCIENTIFIC / COMPUTATIONAL CONSTANTS
+// ============================================================================
+
+var PRODUCT_VERSION = 'v02';
+
+var TREECOVER_THRESHOLD = 30;
+
+var START_YEAR = 2001;
+var END_YEAR   = 2025;
+
+var REDUCE_MAX_PIXELS = 8192;
+var EXPORT_MAX_PIXELS = 1e10;
+
+var FILE_DIMENSIONS = 2048;
+
+var SHARD_SIZE_STANDARD = 64;
+var SHARD_SIZE_60_70    = 64;
+var SHARD_SIZE_70PLUS   = 32;
+
+var HALO_DEGREES = 0.25;
+var SOURCE_BUFFER_M = 20000;
+
+var PRESCREEN_BUFFER_M = 2000;
+
+var HANSEN_ASSET =
+  'UMD/hansen/global_forest_change_2025_v1_13';
+
+var MODIS_GRID_ASSET =
+  'MODIS/061/MOD13A2';
+
+
+// ============================================================================
+// 2. SOURCE DATA + CANONICAL MODIS 1-KM GRID
+// ============================================================================
+
+var hansen =
+  ee.Image(HANSEN_ASSET);
+
+var treecoverSource =
+  hansen.select('treecover2000');
+
+var lossYearSource =
+  hansen.select('lossyear');
+
+var modisReference =
+  ee.ImageCollection(MODIS_GRID_ASSET)
+    .first()
+    .select('NDVI');
+
+var GRID_PROJ =
+  modisReference
+    .projection()
+    .atScale(1000);
+
+var GRID_INFO =
+  GRID_PROJ.getInfo();
+
+var GRID_CRS =
+  GRID_INFO.crs;
+
+var GRID_TRANSFORM =
+  GRID_INFO.transform;
+
+print('GFLC target CRS:', GRID_CRS);
+print('GFLC target transform:', GRID_TRANSFORM);
+print('Expected CRS during original production: SR-ORG:6974');
+
+if (GRID_CRS !== 'SR-ORG:6974') {
+  print(
+    'WARNING: target CRS string differs from SR-ORG:6974. ' +
+    'Inspect the MODIS projection before rebuilding.'
+  );
+}
+
+
+// ============================================================================
+// 3. LABEL / JOB HELPERS
+// ============================================================================
+
+function coordinateTag(x) {
+  var negative = x < 0;
+  var text = String(Math.abs(x)).replace('.', 'p');
+  return negative ? 'm' + text : text;
+}
+
+function spatialID(south, north, west, east) {
+  return (
+    'lat' +
+    coordinateTag(south) + '_' +
+    coordinateTag(north) +
+    '_lon' +
+    coordinateTag(west) + '_' +
+    coordinateTag(east)
+  );
+}
+
+function makeJob(
+  group,
+  west,
+  south,
+  east,
+  north,
+  haloDegrees,
+  shardSize,
+  clipSource,
+  prescreenId
+) {
+
+  var id =
+    spatialID(
+      south,
+      north,
+      west,
+      east
+    );
+
+  var suffix =
+    haloDegrees > 0
+      ? '_halo025'
+      : '';
+
+  return {
+    group: group,
+    west: west,
+    south: south,
+    east: east,
+    north: north,
+    halo: haloDegrees,
+    shardSize: shardSize,
+    clipSource: clipSource,
+    prescreen_id:
+      prescreenId === undefined ? null : prescreenId,
+    id: id,
+    name:
+      'GFLC_' +
+      PRODUCT_VERSION +
+      '_' +
+      id +
+      suffix
+  };
+}
+
+function makeCoreRegion(job) {
+  return ee.Geometry.Rectangle(
+    [
+      job.west,
+      job.south,
+      job.east,
+      job.north
+    ],
+    null,
+    false
+  );
+}
+
+function makeExportRegion(job) {
+
+  if (job.halo === 0) {
+    return makeCoreRegion(job);
+  }
+
+  var haloWest =
+    Math.max(
+      -180,
+      job.west - job.halo
+    );
+
+  var haloEast =
+    Math.min(
+      180,
+      job.east + job.halo
+    );
+
+  var haloSouth =
+    Math.max(
+      -90,
+      job.south - job.halo
+    );
+
+  var haloNorth =
+    Math.min(
+      90,
+      job.north + job.halo
+    );
+
+  return ee.Geometry.Rectangle(
+    [
+      haloWest,
+      haloSouth,
+      haloEast,
+      haloNorth
+    ],
+    null,
+    false
+  );
+}
+
+
+// ============================================================================
+// 4. CANONICAL GFLC CONSTRUCTION
+// ============================================================================
+//
+// For standard tiles, the source images retain their global footprint.
+//
+// For high-latitude tiles, the source images are clipped to:
+//
+//   export halo + 20 km
+//
+// before reduceResolution(). This is the validated high-latitude workflow.
+//
+// ============================================================================
+
+function buildGFLC(job) {
+
+  var treecover2000Raw;
+  var lossYearRaw;
+
+  if (job.clipSource) {
+
+    var sourceRegion =
+      makeExportRegion(job)
+        .buffer(
+          SOURCE_BUFFER_M
+        );
+
+    treecover2000Raw =
+      treecoverSource
+        .clip(
+          sourceRegion
+        );
+
+    lossYearRaw =
+      lossYearSource
+        .clip(
+          sourceRegion
+        );
+
+  } else {
+
+    treecover2000Raw =
+      treecoverSource;
+
+    lossYearRaw =
+      lossYearSource;
+
+  }
+
+
+  // --------------------------------------------------------------------------
+  // Baseline forest
+  // --------------------------------------------------------------------------
+
+  var treecover2000 =
+    treecover2000Raw
+      .unmask(
+        0,
+        true
+      )
+      .toFloat();
+
+  var forest30 =
+    treecover2000Raw
+      .gte(
+        TREECOVER_THRESHOLD
+      )
+      .unmask(
+        0,
+        true
+      )
+      .toFloat();
+
+  var baselineNative =
+    treecover2000
+      .rename(
+        'mean_treecover2000'
+      )
+      .addBands(
+        forest30.rename(
+          'forest_fraction_30pct'
+        )
+      );
+
+  var baseline1km =
+    baselineNative
+      .reduceResolution({
+        reducer:
+          ee.Reducer.mean(),
+
+        maxPixels:
+          REDUCE_MAX_PIXELS
+      })
+      .toFloat();
+
+
+  // --------------------------------------------------------------------------
+  // Annual-loss class
+  //
+  // Hansen lossyear:
+  //   0     = no recorded loss
+  //   1..25 = 2001..2025
+  //
+  // Non-baseline-forest pixels are assigned class 0 before aggregation.
+  // --------------------------------------------------------------------------
+
+  var lossClass =
+    lossYearRaw
+      .where(
+        forest30.eq(0),
+        0
+      )
+      .unmask(
+        0,
+        true
+      )
+      .rename(
+        'loss_class'
+      )
+      .toFloat();
+
+
+  // --------------------------------------------------------------------------
+  // fixedHistogram aggregation
+  // --------------------------------------------------------------------------
+
+  var hist =
+    lossClass
+      .reduceResolution({
+        reducer:
+          ee.Reducer.fixedHistogram(
+            0,
+            26,
+            26
+          ),
+
+        maxPixels:
+          REDUCE_MAX_PIXELS
+      });
+
+  var countsArray =
+    hist
+      .select([0])
+      .arraySlice(
+        1,
+        1,
+        2
+      )
+      .arrayProject(
+        [0]
+      );
+
+  var binNames =
+    ee.List
+      .sequence(
+        0,
+        25
+      )
+      .map(
+        function(code) {
+          return ee.String(
+            'bin_'
+          )
+          .cat(
+            ee.Number(code)
+              .format('%02d')
+          );
+        }
+      );
+
+  var countBands =
+    countsArray
+      .arrayFlatten(
+        [binNames]
+      );
+
+  var totalCount =
+    countBands
+      .reduce(
+        ee.Reducer.sum()
+      );
+
+  var annualBinNames =
+    ee.List
+      .sequence(
+        1,
+        25
+      )
+      .map(
+        function(code) {
+          return ee.String(
+            'bin_'
+          )
+          .cat(
+            ee.Number(code)
+              .format('%02d')
+          );
+        }
+      );
+
+  var annualCounts =
+    countBands
+      .select(
+        annualBinNames
+      );
+
+  var annualFractions =
+    annualCounts
+      .divide(
+        totalCount
+      )
+      .toFloat();
+
+  var yearBandNames =
+    ee.List
+      .sequence(
+        START_YEAR,
+        END_YEAR
+      )
+      .map(
+        function(year) {
+          return ee.String(
+            'loss_cellfrac_'
+          )
+          .cat(
+            ee.Number(year)
+              .format('%d')
+          );
+        }
+      );
+
+  annualFractions =
+    annualFractions
+      .rename(
+        yearBandNames
+      );
+
+
+  // --------------------------------------------------------------------------
+  // Final 27-band product
+  // --------------------------------------------------------------------------
+
+  var outputStack =
+    baseline1km
+      .addBands(
+        annualFractions
+      )
+      .toFloat();
+
+  var forestMask =
+    baseline1km
+      .select(
+        'forest_fraction_30pct'
+      )
+      .gt(0);
+
+  outputStack =
+    outputStack
+      .updateMask(
+        forestMask
+      )
+      .set({
+        product:
+          'Global Forest Loss Cube',
+
+        product_version:
+          'v0.2',
+
+        source_asset:
+          HANSEN_ASSET,
+
+        baseline_year:
+          2000,
+
+        loss_start_year:
+          START_YEAR,
+
+        loss_end_year:
+          END_YEAR,
+
+        baseline_treecover_threshold_pct:
+          TREECOVER_THRESHOLD,
+
+        target_crs:
+          GRID_CRS,
+
+        reduce_resolution_max_pixels:
+          REDUCE_MAX_PIXELS,
+
+        export_shard_size:
+          job.shardSize,
+
+        file_dimensions:
+          FILE_DIMENSIONS,
+
+        tile_id:
+          job.id,
+
+        tile_group:
+          job.group,
+
+        tile_west_lon:
+          job.west,
+
+        tile_east_lon:
+          job.east,
+
+        tile_south_lat:
+          job.south,
+
+        tile_north_lat:
+          job.north,
+
+        export_halo_degrees:
+          job.halo,
+
+        source_buffer_m:
+          job.clipSource
+            ? SOURCE_BUFFER_M
+            : 0
+      });
+
+  return outputStack;
+}
+
+
+// ============================================================================
+// 5. STANDARD JOBS: 60S-60N
+// ============================================================================
+//
+// 48 candidates.
+// Nine were confirmed empty by the completed standard-domain prescreen.
+// The remaining 39 constitute the standard production set.
+//
+// ============================================================================
+
+var EMPTY_STANDARD_TILE_IDS = [
+  'latm60_m30_lonm180_m150',
+  'latm60_m30_lonm150_m120',
+  'latm60_m30_lonm120_m90',
+  'latm60_m30_lonm30_0',
+  'latm60_m30_lon60_90',
+  'latm30_0_lonm150_m120',
+  'latm30_0_lonm30_0',
+  'lat0_30_lonm150_m120',
+  'lat0_30_lon150_180'
+];
+
+function buildStandardJobs() {
+
+  var jobs = [];
+
+  var latStarts =
+    [-60, -30, 0, 30];
+
+  latStarts.forEach(
+    function(south) {
+
+      for (
+        var west = -180;
+        west < 180;
+        west += 30
+      ) {
+
+        var east =
+          west + 30;
+
+        var id =
+          spatialID(
+            south,
+            south + 30,
+            west,
+            east
+          );
+
+        if (
+          EMPTY_STANDARD_TILE_IDS
+            .indexOf(id) === -1
+        ) {
+
+          jobs.push(
+            makeJob(
+              'STANDARD',
+              west,
+              south,
+              east,
+              south + 30,
+              0,
+              SHARD_SIZE_STANDARD,
+              false
+            )
+          );
+
+        }
+      }
+    }
+  );
+
+  return jobs;
+}
+
+
+// ============================================================================
+// 6. HIGH-LATITUDE 60-65N JOBS
+// ============================================================================
+//
+// Full deterministic 10-degree longitude grid.
+// Some candidates may be scientifically empty and therefore produce the
+// expected "No valid (un-masked) pixels" task result.
+//
+// ============================================================================
+
+function buildHighLat60to65Jobs() {
+
+  var jobs = [];
+
+  for (
+    var west = -180;
+    west < 180;
+    west += 10
+  ) {
+
+    jobs.push(
+      makeJob(
+        'HIGHLAT_60_65',
+        west,
+        60,
+        west + 10,
+        65,
+        HALO_DEGREES,
+        SHARD_SIZE_60_70,
+        true
+      )
+    );
+
+  }
+
+  return jobs;
+}
+
+
+// ============================================================================
+// 7. HIGH-LATITUDE 65-70N JOBS
+// ============================================================================
+//
+// All longitude blocks use two 2.5-degree latitude cores.
+//
+// ============================================================================
+
+function buildHighLat65to70Jobs() {
+
+  var jobs = [];
+
+  for (
+    var west = -180;
+    west < 180;
+    west += 10
+  ) {
+
+    jobs.push(
+      makeJob(
+        'HIGHLAT_65_70',
+        west,
+        65,
+        west + 10,
+        67.5,
+        HALO_DEGREES,
+        SHARD_SIZE_60_70,
+        true
+      )
+    );
+
+    jobs.push(
+      makeJob(
+        'HIGHLAT_65_70',
+        west,
+        67.5,
+        west + 10,
+        70,
+        HALO_DEGREES,
+        SHARD_SIZE_60_70,
+        true
+      )
+    );
+
+  }
+
+  return jobs;
+}
+
+
+// ============================================================================
+// 8. 70N+ PRESCREEN CANDIDATE GEOMETRY
+// ============================================================================
+//
+// This reproduces the successful native-Hansen prescreen that generated:
+//
+//   99 candidates
+//   41 KEEP
+//   58 EMPTY
+//
+// Candidate architecture:
+//
+//   70-72.5N extreme longitudes:
+//     -180 to -150
+//      150 to  180
+//     -> 5-degree longitude x 0.5-degree latitude cores
+//
+//   Other 70-72.5N longitudes:
+//     -> 10-degree longitude x 2.5-degree latitude cores
+//
+//   60-70E is omitted from this prescreen because the earlier reference-tile
+//   work already demonstrated no qualifying 70-72.5N output there.
+//
+//   >72.5N:
+//     targeted Siberian candidate list.
+//
+// IMPORTANT:
+//   The prescreen stays in the NATIVE HANSEN projection.
+//   Do not reproject it to the MODIS grid.
+//
+// ============================================================================
+
+function build70PlusPrescreenCandidates() {
+
+  var out = [];
+
+  function addCandidate(
+    group,
+    west,
+    south,
+    east,
+    north
+  ) {
+
+    out.push(
+      makeJob(
+        group,
+        west,
+        south,
+        east,
+        north,
+        0,
+        SHARD_SIZE_70PLUS,
+        false
+      )
+    );
+
+  }
+
+
+  // --------------------------------------------------------------------------
+  // 70-72.5N
+  // --------------------------------------------------------------------------
+
+  for (
+    var lon70 = -180;
+    lon70 < 180;
+    lon70 += 10
+  ) {
+
+    var extreme70 =
+      (lon70 < -150) ||
+      (lon70 >= 150);
+
+    var coveredByEarlierReference =
+      lon70 === 60;
+
+    if (!coveredByEarlierReference) {
+
+      if (extreme70) {
+
+        for (
+          var subLon70 = lon70;
+          subLon70 < lon70 + 10;
+          subLon70 += 5
+        ) {
+
+          for (
+            var lat70 = 70;
+            lat70 < 72.5;
+            lat70 += 0.5
+          ) {
+
+            addCandidate(
+              '70_72p5',
+              subLon70,
+              lat70,
+              subLon70 + 5,
+              lat70 + 0.5
+            );
+
+          }
+        }
+
+      } else {
+
+        addCandidate(
+          '70_72p5',
+          lon70,
+          70,
+          lon70 + 10,
+          72.5
+        );
+
+      }
+    }
+  }
+
+
+  // --------------------------------------------------------------------------
+  // Targeted >72.5N candidates
+  // --------------------------------------------------------------------------
+
+  addCandidate('ARCTIC',  90, 72.5, 100, 73.5);
+  addCandidate('ARCTIC',  90, 73.5, 100, 74.5);
+
+  addCandidate('ARCTIC', 100, 72.5, 110, 73.5);
+  addCandidate('ARCTIC', 100, 73.5, 110, 74.5);
+  addCandidate('ARCTIC', 100, 74.5, 110, 75.0);
+
+  addCandidate('ARCTIC', 110, 72.5, 120, 73.5);
+  addCandidate('ARCTIC', 110, 73.5, 120, 74.5);
+  addCandidate('ARCTIC', 110, 74.5, 120, 75.0);
+
+  addCandidate('ARCTIC', 120, 72.5, 130, 73.0);
+
+  addCandidate('ARCTIC', 140, 72.5, 150, 73.0);
+
+
+  out.forEach(
+    function(job, index) {
+      job.prescreen_id =
+        index + 1;
+    }
+  );
+
+  return out;
+}
+
+
+// ============================================================================
+// 9. FINAL 70N+ KEEP MANIFEST
+// ============================================================================
+//
+// This is the final production manifest generated by the successful prescreen.
+// It is intentionally explicit so GFLC v0.2 can be reproduced without
+// re-running the prescreen.
+//
+// ============================================================================
+
+function build70PlusKeepJobs() {
+
+  var jobs = [];
+
+  function addKeep(
+    prescreenId,
+    group,
+    west,
+    south,
+    east,
+    north
+  ) {
+
+    jobs.push(
+      makeJob(
+        group,
+        west,
+        south,
+        east,
+        north,
+        HALO_DEGREES,
+        SHARD_SIZE_70PLUS,
+        true,
+        prescreenId
+      )
+    );
+
+  }
+
+  addKeep(16, '70_72p5', -165, 70, -160, 70.5);
+  addKeep(17, '70_72p5', -165, 70.5, -160, 71);
+  addKeep(21, '70_72p5', -160, 70, -155, 70.5);
+  addKeep(22, '70_72p5', -160, 70.5, -155, 71);
+  addKeep(23, '70_72p5', -160, 71, -155, 71.5);
+  addKeep(26, '70_72p5', -155, 70, -150, 70.5);
+  addKeep(27, '70_72p5', -155, 70.5, -150, 71);
+  addKeep(28, '70_72p5', -155, 71, -150, 71.5);
+  addKeep(31, '70_72p5', -150, 70, -140, 72.5);
+  addKeep(32, '70_72p5', -140, 70, -130, 72.5);
+  addKeep(33, '70_72p5', -130, 70, -120, 72.5);
+  addKeep(47, '70_72p5', 10, 70, 20, 72.5);
+  addKeep(48, '70_72p5', 20, 70, 30, 72.5);
+  addKeep(49, '70_72p5', 30, 70, 40, 72.5);
+  addKeep(52, '70_72p5', 70, 70, 80, 72.5);
+  addKeep(53, '70_72p5', 80, 70, 90, 72.5);
+  addKeep(54, '70_72p5', 90, 70, 100, 72.5);
+  addKeep(55, '70_72p5', 100, 70, 110, 72.5);
+  addKeep(56, '70_72p5', 110, 70, 120, 72.5);
+  addKeep(57, '70_72p5', 120, 70, 130, 72.5);
+  addKeep(58, '70_72p5', 130, 70, 140, 72.5);
+  addKeep(59, '70_72p5', 140, 70, 150, 72.5);
+  addKeep(60, '70_72p5', 150, 70, 155, 70.5);
+  addKeep(61, '70_72p5', 150, 70.5, 155, 71);
+  addKeep(62, '70_72p5', 150, 71, 155, 71.5);
+  addKeep(63, '70_72p5', 150, 71.5, 155, 72);
+  addKeep(65, '70_72p5', 155, 70, 160, 70.5);
+  addKeep(66, '70_72p5', 155, 70.5, 160, 71);
+  addKeep(67, '70_72p5', 155, 71, 160, 71.5);
+  addKeep(70, '70_72p5', 160, 70, 165, 70.5);
+  addKeep(80, '70_72p5', 170, 70, 175, 70.5);
+  addKeep(90, 'ARCTIC', 90, 72.5, 100, 73.5);
+  addKeep(91, 'ARCTIC', 90, 73.5, 100, 74.5);
+  addKeep(92, 'ARCTIC', 100, 72.5, 110, 73.5);
+  addKeep(93, 'ARCTIC', 100, 73.5, 110, 74.5);
+  addKeep(94, 'ARCTIC', 100, 74.5, 110, 75);
+  addKeep(95, 'ARCTIC', 110, 72.5, 120, 73.5);
+  addKeep(96, 'ARCTIC', 110, 73.5, 120, 74.5);
+  addKeep(97, 'ARCTIC', 110, 74.5, 120, 75);
+  addKeep(98, 'ARCTIC', 120, 72.5, 130, 73);
+  addKeep(99, 'ARCTIC', 140, 72.5, 150, 73);
+
+  return jobs;
+}
+
+
+// ============================================================================
+// 10. NATIVE-HANSEN 70N+ PRESCREEN
+// ============================================================================
+
+function run70PlusPrescreen() {
+
+  var candidates =
+    build70PlusPrescreenCandidates();
+
+  print(
+    '70N+ prescreen candidate count (expected 99):',
+    candidates.length
+  );
+
+  var forest30Native =
+    treecoverSource
+      .gte(
+        TREECOVER_THRESHOLD
+      )
+      .rename(
+        'forest30'
+      );
+
+  var HANSEN_PROJ =
+    treecoverSource
+      .projection();
+
+  var features =
+    candidates.map(
+      function(job) {
+
+        return ee.Feature(
+          makeCoreRegion(job),
+          {
+            candidate_id:
+              job.prescreen_id,
+
+            name:
+              job.id,
+
+            group:
+              job.group,
+
+            west:
+              job.west,
+
+            south:
+              job.south,
+
+            east:
+              job.east,
+
+            north:
+              job.north
+          }
+        );
+
+      }
+    );
+
+  var candidateFC =
+    ee.FeatureCollection(
+      features
+    );
+
+  var screened =
+    candidateFC.map(
+      function(f) {
+
+        var region =
+          f.geometry()
+            .buffer(
+              PRESCREEN_BUFFER_M
+            );
+
+        var result =
+          forest30Native
+            .reduceRegion({
+              reducer:
+                ee.Reducer.max(),
+
+              geometry:
+                region,
+
+              crs:
+                HANSEN_PROJ,
+
+              scale:
+                30,
+
+              maxPixels:
+                1e9,
+
+              tileScale:
+                16
+            });
+
+        var presence =
+          ee.Number(
+            ee.Algorithms.If(
+              result.contains(
+                'forest30'
+              ),
+              result.get(
+                'forest30'
+              ),
+              0
+            )
+          );
+
+        var status =
+          ee.Algorithms.If(
+            presence.eq(1),
+            'KEEP',
+            'EMPTY'
+          );
+
+        return f.set({
+          forest30_present:
+            presence,
+
+          status:
+            status
+        });
+
+      }
+    );
+
+  var keep =
+    screened.filter(
+      ee.Filter.eq(
+        'status',
+        'KEEP'
+      )
+    );
+
+  var empty =
+    screened.filter(
+      ee.Filter.eq(
+        'status',
+        'EMPTY'
+      )
+    );
+
+  print(
+    'KEEP count (expected 41):',
+    keep.size()
+  );
+
+  print(
+    'EMPTY count (expected 58):',
+    empty.size()
+  );
+
+  print(
+    'KEEP candidates:',
+    keep
+  );
+
+  if (CREATE_EXPORT_TASKS) {
+
+    Export.table.toDrive({
+      collection:
+        screened,
+
+      description:
+        'GFLC_remaining_70plus_native_prescreen',
+
+      folder:
+        DRIVE_FOLDER,
+
+      fileNamePrefix:
+        'GFLC_remaining_70plus_native_prescreen',
+
+      fileFormat:
+        'CSV',
+
+      selectors: [
+        'candidate_id',
+        'name',
+        'group',
+        'west',
+        'south',
+        'east',
+        'north',
+        'forest30_present',
+        'status'
+      ]
+    });
+
+    print(
+      'Prescreen CSV export task added.'
+    );
+
+  } else {
+
+    print(
+      'DRY RUN: prescreen evaluated for Console output; ' +
+      'set CREATE_EXPORT_TASKS=true to add the CSV export task.'
+    );
+
+  }
+}
+
+
+// ============================================================================
+// 11. SELECT PRODUCTION STAGE
+// ============================================================================
+
+function buildJobsForStage(stage) {
+
+  if (stage === 'STANDARD') {
+    return buildStandardJobs();
+  }
+
+  if (stage === 'HIGHLAT_60_65') {
+    return buildHighLat60to65Jobs();
+  }
+
+  if (stage === 'HIGHLAT_65_70') {
+    return buildHighLat65to70Jobs();
+  }
+
+  if (stage === 'HIGHLAT_70PLUS_KEEP') {
+    return build70PlusKeepJobs();
+  }
+
+  throw new Error(
+    'Unknown production RUN_STAGE: ' +
+    stage
+  );
+}
+
+
+// ============================================================================
+// 12. RUN
+// ============================================================================
+
+if (RUN_STAGE === 'PRESCREEN_70PLUS') {
+
+  run70PlusPrescreen();
+
+} else {
+
+  var jobs =
+    buildJobsForStage(
+      RUN_STAGE
+    );
+
+  jobs.forEach(
+    function(job, index) {
+      job.job_id =
+        index + 1;
+    }
+  );
+
+  var selectedJobs =
+    jobs.filter(
+      function(job) {
+
+        var inRange =
+          job.job_id >= FIRST_JOB &&
+          job.job_id <= LAST_JOB;
+
+        var skipped =
+          SKIP_JOB_IDS.indexOf(
+            job.job_id
+          ) !== -1;
+
+        return (
+          inRange &&
+          !skipped
+        );
+
+      }
+    );
+
+
+  // --------------------------------------------------------------------------
+  // Stage manifest
+  // --------------------------------------------------------------------------
+
+  print(
+    '===================================================='
+  );
+
+  print(
+    'GFLC MASTER PRODUCTION'
+  );
+
+  print(
+    'RUN_STAGE:',
+    RUN_STAGE
+  );
+
+  print(
+    'Stage job count:',
+    jobs.length
+  );
+
+  print(
+    'Requested jobs:',
+    FIRST_JOB +
+      ' to ' +
+      LAST_JOB
+  );
+
+  print(
+    'Tasks selected:',
+    selectedJobs.length
+  );
+
+  selectedJobs.forEach(
+    function(job) {
+
+      print(
+        'JOB ' +
+        job.job_id +
+        ' | ' +
+        job.name +
+        (
+          job.prescreen_id === null
+            ? ''
+            : ' | prescreen=' +
+              job.prescreen_id
+        )
+      );
+
+    }
+  );
+
+  print(
+    '===================================================='
+  );
+
+
+  // --------------------------------------------------------------------------
+  // Export tasks
+  // --------------------------------------------------------------------------
+
+  if (CREATE_EXPORT_TASKS) {
+
+    selectedJobs.forEach(
+      function(job) {
+
+        var outputStack =
+          buildGFLC(
+            job
+          );
+
+        var exportRegion =
+          makeExportRegion(
+            job
+          );
+
+        Export.image.toDrive({
+          image:
+            outputStack,
+
+          description:
+            job.name,
+
+          folder:
+            DRIVE_FOLDER,
+
+          fileNamePrefix:
+            job.name,
+
+          region:
+            exportRegion,
+
+          crs:
+            GRID_CRS,
+
+          crsTransform:
+            GRID_TRANSFORM,
+
+          maxPixels:
+            EXPORT_MAX_PIXELS,
+
+          shardSize:
+            job.shardSize,
+
+          fileDimensions:
+            FILE_DIMENSIONS,
+
+          skipEmptyTiles:
+            true,
+
+          fileFormat:
+            'GeoTIFF',
+
+          formatOptions: {
+            cloudOptimized:
+              true
+          }
+        });
+
+      }
+    );
+
+    print(
+      'Export tasks added:',
+      selectedJobs.length
+    );
+
+  } else {
+
+    print(
+      'DRY RUN ONLY: CREATE_EXPORT_TASKS=false. ' +
+      'No raster export tasks were created.'
+    );
+
+  }
+
+
+  // --------------------------------------------------------------------------
+  // Geometry-only QA
+  // --------------------------------------------------------------------------
+
+  if (selectedJobs.length > 0) {
+
+    var firstSelected =
+      selectedJobs[0];
+
+    var firstCore =
+      makeCoreRegion(
+        firstSelected
+      );
+
+    var firstExport =
+      makeExportRegion(
+        firstSelected
+      );
+
+    Map.centerObject(
+      firstCore,
+      3
+    );
+
+    Map.addLayer(
+      firstCore,
+      {color: 'red'},
+      'First selected CORE',
+      true
+    );
+
+    Map.addLayer(
+      firstExport,
+      {color: 'yellow'},
+      'First selected EXPORT',
+      true
+    );
+
+  }
+}
+
+
+// ============================================================================
+// END GFLC v0.2 MASTER REPRODUCIBLE SCRIPT
+// ============================================================================
